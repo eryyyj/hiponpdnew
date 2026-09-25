@@ -1,0 +1,35 @@
+# pip install -r requirements.txt
+#
+# Standard library (do not pip-install): threading, time, os, subprocess,
+# shutil, tempfile, traceback, glob, io, json, math, re, queue, argparse, sys
+#
+# On a Raspberry Pi, install the camera stack with apt so numpy ABI matches:
+#   sudo apt install python3-picamera2 python3-pil python3-numpy python3-opencv
+#   sudo apt install libcap-dev chromium-browser
+# Then create the venv with: python3 -m venv --system-site-packages .venv
+
+# Web UI
+flask
+Werkzeug
+Jinja2
+click
+itsdangerous
+blinker
+
+# Serial (ESP32)
+pyserial
+
+# Camera frames, overlays, snapshots
+numpy
+Pillow
+opencv-python
+
+# picamera2 JPEG / DNG helpers (needed when picamera2 is installed via pip)
+simplejpeg
+piexif
+pidng
+
+# Raspberry Pi AI Camera. Prefer apt python3-picamera2 on the Pi.
+# pip may fail or conflict with libcamera; install.sh falls back to apt.
+picamera2
+# python-prctl  # Pi only; requires apt libcap-dev

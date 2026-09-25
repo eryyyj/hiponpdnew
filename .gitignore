@@ -1,0 +1,14 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.DS_Store
+*.rpk
+esp32_snapshots/
+calibration_defaults.json
+automation_defaults.json
+camera_defaults.json
+*.log
+.idea/
+.vscode/
