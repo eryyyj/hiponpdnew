@@ -24,6 +24,9 @@ numpy
 Pillow
 opencv-python
 
+# NCNN runtime for direct 640x640 model inference
+ncnn
+
 # picamera2 JPEG / DNG helpers (needed when picamera2 is installed via pip)
 simplejpeg
 piexif

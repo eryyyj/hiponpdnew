@@ -107,6 +107,14 @@ except Exception:
     CV2_AVAILABLE = False
 
 try:
+    from ncnn_detector import NcnnShrimpCounter
+    NCNN_AVAILABLE = True
+except Exception:
+    print("[Camera] NCNN loader unavailable; falling back to IMX500 path if present.")
+    NcnnShrimpCounter = None
+    NCNN_AVAILABLE = False
+
+try:
     from picamera2 import MappedArray, Picamera2, Preview
     from picamera2.devices import IMX500
     from picamera2.devices.imx500 import (
@@ -135,6 +143,24 @@ except Exception:
 CAMERA_RESOLUTION = (640, 480)          # native-friendly IMX500 preview size
 SNAPSHOT_DIR = os.path.expanduser("~/esp32_snapshots")
 CAMERA_FPS_INTERVAL_MS = 50             # ~20 fps refresh of the live feed
+
+# ---------------------------------------------------------------------------
+# Model selection
+# ---------------------------------------------------------------------------
+USE_NCNN_MODEL = True
+
+# Preferred for Pi 5 / CPU inference when the NCNN export is present.
+# Update these paths to your actual exported model files.
+NCNN_MODEL_PARAM = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "models", "shrimp_ncnn.param"
+)
+NCNN_MODEL_BIN = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "models", "shrimp_ncnn.bin"
+)
+NCNN_LABELS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "models", "labels.txt"
+)
+NCNN_INPUT_SIZE = (640, 640)
 
 # ---------------------------------------------------------------------------
 # IMX500 shrimp detection/counting configuration
@@ -2540,8 +2566,11 @@ class CameraManager:
         self.available = False
         self.picam2 = None
         self.imx500 = None
+        self.ncnn_detector = None
+        self.camera_cap = None
         self.intrinsics = None
         self.labels = []
+        self.use_ncnn = USE_NCNN_MODEL and NCNN_AVAILABLE
 
         # Object tracking / counting state (mirrors camera.py's globals)
         self.tracked_objects = {}
@@ -2563,12 +2592,24 @@ class CameraManager:
     def start(self):
         if self.available:
             return True
-        if not PICAMERA2_AVAILABLE:
-            print("[Camera] picamera2 not available - showing placeholder feed.")
-            return False
         if not CV2_AVAILABLE:
             print("[Camera] opencv-python not available - showing placeholder feed.")
             return False
+
+        if self.use_ncnn:
+            try:
+                self._setup_ncnn()
+                self.available = True
+                return True
+            except Exception as exc:
+                print(f"[Camera] NCNN fallback failed: {exc}")
+                traceback.print_exc()
+                self.use_ncnn = False
+
+        if not PICAMERA2_AVAILABLE:
+            print("[Camera] picamera2 not available - showing placeholder feed.")
+            return False
+
         try:
             self._setup_imx500()
             self.available = True
@@ -2582,6 +2623,36 @@ class CameraManager:
     # ------------------------------------------------------------------
     # Setup
     # ------------------------------------------------------------------
+    def _setup_ncnn(self):
+        """Initialize the NCNN model for Pi 5 CPU inference using a standard camera."""
+        if not os.path.isfile(NCNN_MODEL_PARAM):
+            raise FileNotFoundError(f"NCNN param file not found: {NCNN_MODEL_PARAM}")
+        if not os.path.isfile(NCNN_MODEL_BIN):
+            raise FileNotFoundError(f"NCNN bin file not found: {NCNN_MODEL_BIN}")
+        if not os.path.isfile(NCNN_LABELS_PATH):
+            raise FileNotFoundError(f"NCNN labels file not found: {NCNN_LABELS_PATH}")
+
+        self.ncnn_detector = NcnnShrimpCounter(
+            model_param=NCNN_MODEL_PARAM,
+            model_bin=NCNN_MODEL_BIN,
+            labels_path=NCNN_LABELS_PATH,
+            input_size=NCNN_INPUT_SIZE,
+            conf_threshold=DETECTION_THRESHOLD,
+            iou_threshold=DETECTION_IOU,
+            num_threads=max(2, min(8, os.cpu_count() or 4)),
+        )
+        self.labels = self.ncnn_detector.labels
+        self.last_results = []
+        self._last_det_log = 0.0
+
+        self.camera_cap = cv2.VideoCapture(0)
+        if not self.camera_cap.isOpened():
+            raise RuntimeError("Could not open camera for NCNN inference.")
+        self.camera_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.camera_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.camera_cap.set(cv2.CAP_PROP_FPS, 20)
+        print("[Camera] NCNN model initialized and camera capture ready.")
+
     def _setup_imx500(self):
         if not os.path.isfile(IMX500_MODEL_PATH):
             raise FileNotFoundError(
@@ -2696,8 +2767,29 @@ class CameraManager:
               f"{timeout_s}s; starting the UI anyway.")
 
     def pump_metadata(self):
-        """Same as the working demo's main loop: pull inference metadata only."""
-        if not self.available or self.picam2 is None:
+        """Use either IMX500 metadata or the NCNN detector path."""
+        if not self.available:
+            return
+
+        if self.use_ncnn:
+            if self.camera_cap is None or not self.camera_cap.isOpened():
+                self.camera_cap = cv2.VideoCapture(0)
+                if not self.camera_cap.isOpened():
+                    return
+
+            ok, frame = self.camera_cap.read()
+            if not ok or frame is None:
+                return
+
+            detections = self.ncnn_detector.detect(frame)
+            self.last_results = detections
+
+            annotated = frame.copy()
+            self._annotate_and_count(annotated, detections)
+            latest_frame.set(Image.fromarray(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)))
+            return
+
+        if self.picam2 is None:
             return
         metadata = self.picam2.capture_metadata()
         self.last_results = self._parse_detections(metadata)
@@ -3060,6 +3152,13 @@ class CameraManager:
         return img
 
     def stop(self):
+        if self.camera_cap is not None:
+            try:
+                self.camera_cap.release()
+            except Exception:
+                pass
+            self.camera_cap = None
+
         if self.available and self.picam2 is not None:
             try:
                 self.picam2.stop()
@@ -3523,10 +3622,10 @@ def launch_kiosk_browser(url):
 
 
 if __name__ == "__main__":
-    # Start the IMX500 camera first, on the main thread, with no other
-    # worker threads running. Firmware upload can take several minutes.
-    print("[Startup] Loading IMX500 firmware first (can take several minutes).")
-    print("[Startup] Flask and kiosk start only after 'Camera is ready'.")
+    # Prefer the NCNN path on Raspberry Pi 5, and only fall back to the
+    # IMX500 firmware path when it is explicitly needed.
+    print("[Startup] Initializing camera pipeline (NCNN preferred, IMX500 fallback).")
+    print("[Startup] Flask and kiosk start only after the camera reports ready.")
     camera_mgr.start()
     serial_mgr.start_watcher()
 
