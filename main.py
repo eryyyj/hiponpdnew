@@ -107,11 +107,12 @@ except Exception:
     CV2_AVAILABLE = False
 
 try:
-    from ncnn_detector import NcnnShrimpCounter
+    from ncnn_detector import NcnnDetector, ShrimpCounter
     NCNN_AVAILABLE = True
 except Exception:
     print("[Camera] NCNN loader unavailable; falling back to IMX500 path if present.")
-    NcnnShrimpCounter = None
+    NcnnDetector = None
+    ShrimpCounter = None
     NCNN_AVAILABLE = False
 
 try:
@@ -150,15 +151,38 @@ CAMERA_FPS_INTERVAL_MS = 50             # ~20 fps refresh of the live feed
 USE_NCNN_MODEL = True
 
 # Preferred for Pi 5 / CPU inference when the NCNN export is present.
-# Update these paths to your actual exported model files.
-NCNN_MODEL_PARAM = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "models", "shrimp_ncnn.param"
+# Actual Ultralytics export shape from:
+#   yolo export model=best.pt format=ncnn imgsz=640
+# creates a folder like:
+#   models/best_ncnn_model/model.ncnn.param
+#   models/best_ncnn_model/model.ncnn.bin
+# plus the labels file in the same export folder if available.
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_NCNN_EXPORT_DIR = os.path.join(_PROJECT_ROOT, "models", "best_ncnn_model")
+_NCNN_LEGACY_DIR = os.path.join(_PROJECT_ROOT, "models")
+
+
+def _first_existing(*candidates):
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return candidates[0]
+
+
+NCNN_MODEL_DIR = _first_existing(_NCNN_EXPORT_DIR, _NCNN_LEGACY_DIR)
+NCNN_MODEL_PARAM = _first_existing(
+    os.path.join(NCNN_MODEL_DIR, "model.ncnn.param"),
+    os.path.join(_NCNN_LEGACY_DIR, "shrimp_ncnn.param"),
+    os.path.join(_NCNN_LEGACY_DIR, "model.ncnn.param"),
 )
-NCNN_MODEL_BIN = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "models", "shrimp_ncnn.bin"
+NCNN_MODEL_BIN = _first_existing(
+    os.path.join(NCNN_MODEL_DIR, "model.ncnn.bin"),
+    os.path.join(_NCNN_LEGACY_DIR, "shrimp_ncnn.bin"),
+    os.path.join(_NCNN_LEGACY_DIR, "model.ncnn.bin"),
 )
-NCNN_LABELS_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "models", "labels.txt"
+NCNN_LABELS_PATH = _first_existing(
+    os.path.join(NCNN_MODEL_DIR, "labels.txt"),
+    os.path.join(_NCNN_LEGACY_DIR, "labels.txt"),
 )
 NCNN_INPUT_SIZE = (640, 640)
 
@@ -2629,19 +2653,27 @@ class CameraManager:
             raise FileNotFoundError(f"NCNN param file not found: {NCNN_MODEL_PARAM}")
         if not os.path.isfile(NCNN_MODEL_BIN):
             raise FileNotFoundError(f"NCNN bin file not found: {NCNN_MODEL_BIN}")
-        if not os.path.isfile(NCNN_LABELS_PATH):
-            raise FileNotFoundError(f"NCNN labels file not found: {NCNN_LABELS_PATH}")
 
-        self.ncnn_detector = NcnnShrimpCounter(
-            model_param=NCNN_MODEL_PARAM,
-            model_bin=NCNN_MODEL_BIN,
-            labels_path=NCNN_LABELS_PATH,
-            input_size=NCNN_INPUT_SIZE,
-            conf_threshold=DETECTION_THRESHOLD,
-            iou_threshold=DETECTION_IOU,
-            num_threads=max(2, min(8, os.cpu_count() or 4)),
+        if os.path.isfile(NCNN_LABELS_PATH):
+            with open(NCNN_LABELS_PATH, "r", encoding="utf-8") as fh:
+                self.labels = [line.strip() for line in fh if line.strip()]
+        else:
+            self.labels = ["shrimp"]
+
+        self.ncnn_detector = ShrimpCounter(
+            detector=NcnnDetector(
+                param_path=NCNN_MODEL_PARAM,
+                bin_path=NCNN_MODEL_BIN,
+                input_size=max(NCNN_INPUT_SIZE),
+                conf_threshold=DETECTION_THRESHOLD,
+                iou_threshold=DETECTION_IOU,
+                max_detections=DETECTION_MAX_DETECTIONS,
+                num_threads=max(2, min(8, os.cpu_count() or 4)),
+                frame_is_bgr=True,
+            ),
+            line_y_fraction=self.get_count_line_y_fraction(),
+            direction="down",
         )
-        self.labels = self.ncnn_detector.labels
         self.last_results = []
         self._last_det_log = 0.0
 
@@ -2781,7 +2813,20 @@ class CameraManager:
             if not ok or frame is None:
                 return
 
-            detections = self.ncnn_detector.detect(frame)
+            raw_detections = self.ncnn_detector.process(frame)
+            detections = [
+                {
+                    "box": (
+                        float(x1),
+                        float(y1),
+                        float(max(0.0, x2 - x1)),
+                        float(max(0.0, y2 - y1)),
+                    ),
+                    "category": int(class_id),
+                    "conf": float(conf),
+                }
+                for x1, y1, x2, y2, conf, class_id in raw_detections
+            ]
             self.last_results = detections
 
             annotated = frame.copy()

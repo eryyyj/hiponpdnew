@@ -1,329 +1,363 @@
-from __future__ import annotations
+#!/usr/bin/env python3
+"""
+ncnn_detector.py - YOLO11 (Ultralytics ncnn export) shrimp detection + counting.
 
-import math
-from typing import List, Tuple
+Replaces the IMX500 (.rpk / on-sensor) inference path. The AI Camera is now
+used as a plain camera: Picamera2 captures frames, this module runs the ncnn
+model on the Pi CPU, then tracks centroids and counts crossings of the
+horizontal counting line (same tracker constants as main.py).
+
+Export the model on your PC (not on the Pi):
+    pip install ultralytics
+    yolo export model=best.pt format=ncnn imgsz=640
+-> best_ncnn_model/model.ncnn.param + model.ncnn.bin (+ metadata.yaml)
+
+Pipeline per frame:
+    frame (e.g. 640x480) -> letterbox to 640x640 -> RGB -> /255 -> ncnn
+    -> (4+nc, 8400) tensor -> conf filter -> NMS -> map back to frame coords
+    -> centroid tracker -> line-crossing count
+"""
+
+import threading
+import time
 
 import cv2
 import numpy as np
+import ncnn
 
-try:
-    import ncnn
-except ImportError as exc:  # pragma: no cover - imported only at runtime
-    raise RuntimeError(
-        "ncnn is required. Install it with: pip install ncnn"
-    ) from exc
+# ---------------------------------------------------------------------------
+# Config (mirrors the constants in main.py where they exist)
+# ---------------------------------------------------------------------------
+NCNN_PARAM_PATH = "/home/admin/Desktop/hipon/models/best_ncnn_model/model.ncnn.param"
+NCNN_BIN_PATH = "/home/admin/Desktop/hipon/models/best_ncnn_model/model.ncnn.bin"
+NCNN_INPUT_SIZE = 640
+
+# Ultralytics' ncnn export names the blobs "in0" / "out0".
+# If you exported differently, check the first and last lines of model.ncnn.param.
+NCNN_INPUT_BLOB = "in0"
+NCNN_OUTPUT_BLOB = "out0"
+
+DETECTION_THRESHOLD = 0.55
+DETECTION_IOU = 0.65
+DETECTION_MAX_DETECTIONS = 10
+
+MAX_TRACK_DISTANCE = 80        # px, centroid match distance between frames
+MAX_DISAPPEARED_FRAMES = 100   # frames an object can be unseen before dropped
+
+NUM_THREADS = 4                # Pi 4/5 have 4 cores
+LETTERBOX_PAD_VALUE = 114      # Ultralytics' default padding gray
 
 
-class NcnnShrimpCounter:
-    """YOLO-style ncnn object detector + count-line tracker for shrimp.
-
-    This mirrors the current app's logic: resize/letterbox to 640x640,
-    run the ncnn model, decode the YOLO outputs, and count objects as they
-    cross a horizontal count line. The detector expects a YOLOv8-style export
-    produced by NCNN, with an input size of 640x640.
-    """
+# ---------------------------------------------------------------------------
+# Detector
+# ---------------------------------------------------------------------------
+class NcnnDetector:
+    """Loads the ncnn model once; call detect(frame) for every frame."""
 
     def __init__(
         self,
-        model_param: str,
-        model_bin: str,
-        labels_path: str | None = None,
-        input_size: Tuple[int, int] = (640, 640),
-        conf_threshold: float = 0.25,
-        iou_threshold: float = 0.45,
-        num_threads: int = 4,
-        input_name: str = "images",
-        output_names: Tuple[str, ...] = ("output",),
+        param_path=NCNN_PARAM_PATH,
+        bin_path=NCNN_BIN_PATH,
+        input_size=NCNN_INPUT_SIZE,
+        conf_threshold=DETECTION_THRESHOLD,
+        iou_threshold=DETECTION_IOU,
+        max_detections=DETECTION_MAX_DETECTIONS,
+        num_threads=NUM_THREADS,
+        frame_is_bgr=False,
     ):
         self.input_size = input_size
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
-        self.labels = self._load_labels(labels_path) if labels_path else ["shrimp"]
-        self.input_name = input_name
-        self.output_names = output_names
+        self.max_detections = max_detections
+        # Set True if your frames are BGR-ordered in memory (cv2.imread style).
+        # NOTE: Picamera2's "RGB888" format is actually laid out B,G,R in the
+        # numpy array. If boxes look right but confidence is poor, flip this.
+        self.frame_is_bgr = frame_is_bgr
 
         self.net = ncnn.Net()
-        self.net.opt.use_vulkan_compute = False
+        self.net.opt.use_vulkan_compute = False   # no usable Vulkan on Pi CPU path
         self.net.opt.num_threads = num_threads
-        self.net.load_param(model_param)
-        self.net.load_model(model_bin)
-        self.extractor = self.net.create_extractor()
+        if self.net.load_param(param_path) != 0:
+            raise RuntimeError(f"Failed to load ncnn param: {param_path}")
+        if self.net.load_model(bin_path) != 0:
+            raise RuntimeError(f"Failed to load ncnn bin: {bin_path}")
 
-        self.tracked_objects: dict[int, dict] = {}
-        self.next_object_id = 0
-        self.total_count = 0
+    # -- preprocessing ------------------------------------------------------
+    def preprocess(self, frame):
+        """Letterbox to input_size x input_size, convert to an RGB ncnn.Mat.
 
-    def _load_labels(self, labels_path: str) -> List[str]:
-        with open(labels_path, "r", encoding="utf-8") as handle:
-            labels = [line.strip() for line in handle if line.strip()]
-        return labels or ["shrimp"]
+        Returns (mat, scale, pad_left, pad_top) so boxes can be mapped back.
+        Aspect ratio is preserved: a 640x480 frame becomes 640x480 content
+        with 80 px gray bars top and bottom (scale = 1.0).
+        """
+        size = self.input_size
+        h, w = frame.shape[:2]
+        scale = min(size / h, size / w)
+        new_w, new_h = int(round(w * scale)), int(round(h * scale))
 
-    def preprocess(self, frame_bgr: np.ndarray) -> Tuple[ncnn.Mat, dict]:
-        """Letterbox + normalize a frame to 640x640 for the ncnn model."""
-        h, w = frame_bgr.shape[:2]
-        target_w, target_h = self.input_size
+        resized = frame
+        if (new_w, new_h) != (w, h):
+            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-        scale = min(target_w / w, target_h / h)
-        new_w = max(1, int(round(w * scale)))
-        new_h = max(1, int(round(h * scale)))
-
-        resized = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        canvas = np.full((target_h, target_w, 3), 114, dtype=np.uint8)
-        offset_x = (target_w - new_w) // 2
-        offset_y = (target_h - new_h) // 2
-        canvas[offset_y:offset_y + new_h, offset_x:offset_x + new_w] = resized
-
-        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-        rgb = rgb.astype(np.float32) / 255.0
-
-        mat = ncnn.Mat.from_pixels(
-            rgb,
-            ncnn.Mat_PIXEL_RGB,
-            target_w,
-            target_h,
+        pad_w, pad_h = size - new_w, size - new_h
+        left, top = pad_w // 2, pad_h // 2
+        padded = cv2.copyMakeBorder(
+            resized, top, pad_h - top, left, pad_w - left,
+            cv2.BORDER_CONSTANT,
+            value=(LETTERBOX_PAD_VALUE,) * 3,
         )
 
-        meta = {
-            "scale": scale,
-            "offset_x": offset_x,
-            "offset_y": offset_y,
-            "new_w": new_w,
-            "new_h": new_h,
-            "original_size": (w, h),
-        }
-        return mat, meta
+        if self.frame_is_bgr:
+            padded = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+        padded = np.ascontiguousarray(padded, dtype=np.uint8)
 
-    def _extract_output_tensors(self):
-        out_list = []
-        for name in self.output_names:
-            try:
-                _, mat = self.extractor.extract(name)
-            except Exception:
-                continue
-            if mat is not None:
-                out_list.append(mat)
-        return out_list
+        mat = ncnn.Mat.from_pixels(
+            padded, ncnn.Mat.PixelType.PIXEL_RGB, size, size
+        )
+        mat.substract_mean_normalize([0.0, 0.0, 0.0], [1 / 255.0] * 3)
+        return mat, scale, left, top
 
-    def _mat_to_numpy(self, mat: ncnn.Mat) -> np.ndarray:
-        try:
-            return np.array(mat)
-        except Exception:
-            pass
+    # -- inference ----------------------------------------------------------
+    def detect(self, frame):
+        """Run the model. Returns a list of (x1, y1, x2, y2, conf, class_id)
+        in ORIGINAL frame pixel coordinates."""
+        mat, scale, pad_left, pad_top = self.preprocess(frame)
 
-        if hasattr(mat, "to_numpy"):
-            try:
-                return mat.to_numpy()
-            except Exception:
-                pass
+        with self.net.create_extractor() as ex:
+            ex.input(NCNN_INPUT_BLOB, mat)
+            ret, out = ex.extract(NCNN_OUTPUT_BLOB)
+        if ret != 0:
+            raise RuntimeError(f"ncnn extract('{NCNN_OUTPUT_BLOB}') failed: {ret}")
 
-        if hasattr(mat, "clone"):
-            try:
-                clone = mat.clone()
-                return np.array(clone)
-            except Exception:
-                pass
+        pred = np.array(out)
+        return self._postprocess(pred, frame.shape[:2], scale, pad_left, pad_top)
 
-        raise TypeError(f"Could not convert ncnn.Mat to numpy for {type(mat)}")
+    # -- postprocessing -----------------------------------------------------
+    def _postprocess(self, pred, frame_hw, scale, pad_left, pad_top):
+        pred = np.squeeze(pred)
+        if pred.ndim != 2:
+            raise ValueError(f"Unexpected ncnn output shape: {pred.shape}")
+        # Ultralytics output is (4+nc, num_anchors); make it (num_anchors, 4+nc)
+        if pred.shape[0] < pred.shape[1]:
+            pred = pred.T
 
-    def _decode_yolov8(self, pred: np.ndarray, meta: dict):
-        """Decode a YOLOv8-style NCNN output to boxes / scores."""
-        if pred.size == 0:
-            return []
-
-        pred = np.asarray(pred, dtype=np.float32)
-        if pred.ndim == 3:
-            pred = pred.reshape(-1, pred.shape[-1])
-
-        # YOLOv8 style output: [cx, cy, w, h, obj_conf, cls_0, cls_1, ...]
-        box_columns = pred[:, :4]
-        class_scores = pred[:, 4:]
-
-        if class_scores.shape[1] == 0:
-            return []
-
-        max_scores = class_scores.max(axis=1)
+        boxes_cxcywh = pred[:, :4]
+        class_scores = pred[:, 4:]            # already sigmoid-ed by the export
         class_ids = class_scores.argmax(axis=1)
-        valid = max_scores >= self.conf_threshold
+        confs = class_scores.max(axis=1)
 
-        detections = []
-        for idx in np.where(valid)[0]:
-            cx, cy, w, h = box_columns[idx]
-            score = float(max_scores[idx])
-            cls_id = int(class_ids[idx])
+        keep = confs >= self.conf_threshold
+        if not np.any(keep):
+            return []
+        boxes_cxcywh, confs, class_ids = boxes_cxcywh[keep], confs[keep], class_ids[keep]
 
-            if w <= 0 or h <= 0:
-                continue
+        # letterbox space -> original frame space
+        cx = (boxes_cxcywh[:, 0] - pad_left) / scale
+        cy = (boxes_cxcywh[:, 1] - pad_top) / scale
+        bw = boxes_cxcywh[:, 2] / scale
+        bh = boxes_cxcywh[:, 3] / scale
+        x1, y1 = cx - bw / 2, cy - bh / 2
 
-            x1 = (cx - w / 2.0)
-            y1 = (cy - h / 2.0)
-            x2 = (cx + w / 2.0)
-            y2 = (cy + h / 2.0)
+        h, w = frame_hw
+        nms_boxes = np.stack([x1, y1, bw, bh], axis=1).tolist()
+        idxs = cv2.dnn.NMSBoxes(
+            nms_boxes, confs.tolist(), self.conf_threshold, self.iou_threshold
+        )
+        idxs = np.array(idxs).flatten()[: self.max_detections]
 
-            x1 = (x1 - meta["offset_x"]) / meta["scale"]
-            y1 = (y1 - meta["offset_y"]) / meta["scale"]
-            x2 = (x2 - meta["offset_x"]) / meta["scale"]
-            y2 = (y2 - meta["offset_y"]) / meta["scale"]
+        dets = []
+        for i in idxs:
+            bx1 = float(np.clip(x1[i], 0, w - 1))
+            by1 = float(np.clip(y1[i], 0, h - 1))
+            bx2 = float(np.clip(x1[i] + bw[i], 0, w - 1))
+            by2 = float(np.clip(y1[i] + bh[i], 0, h - 1))
+            dets.append((bx1, by1, bx2, by2, float(confs[i]), int(class_ids[i])))
+        return dets
 
-            out_w, out_h = meta["original_size"]
-            x1 = max(0, min(out_w, x1))
-            y1 = max(0, min(out_h, y1))
-            x2 = max(0, min(out_w, x2))
-            y2 = max(0, min(out_h, y2))
 
-            detections.append(
-                {
-                    "box": (float(x1), float(y1), float(x2 - x1), float(y2 - y1)),
-                    "conf": score,
-                    "category": cls_id,
-                }
-            )
+# ---------------------------------------------------------------------------
+# Centroid tracker + counting line
+# ---------------------------------------------------------------------------
+class CentroidTracker:
+    def __init__(self, max_distance=MAX_TRACK_DISTANCE, max_disappeared=MAX_DISAPPEARED_FRAMES):
+        self.max_distance = max_distance
+        self.max_disappeared = max_disappeared
+        self.next_id = 0
+        self.objects = {}      # id -> (cx, cy)
+        self.prev_y = {}       # id -> previous cy (for crossing test)
+        self.disappeared = {}  # id -> frames unseen
 
-        return detections
+    def update(self, centroids):
+        """Greedy nearest-neighbour match. Returns {id: (cx, cy, prev_cy)}."""
+        if not centroids:
+            for oid in list(self.objects):
+                self._mark_missing(oid)
+            return {}
 
-    def detect(self, frame_bgr: np.ndarray) -> List[dict]:
-        """Run a forward pass and return raw detection dicts."""
-        mat, meta = self.preprocess(frame_bgr)
+        if not self.objects:
+            for c in centroids:
+                self._register(c)
+        else:
+            ids = list(self.objects)
+            obj_pts = np.array([self.objects[i] for i in ids], dtype=float)
+            new_pts = np.array(centroids, dtype=float)
+            dist = np.linalg.norm(obj_pts[:, None, :] - new_pts[None, :, :], axis=2)
 
-        try:
-            self.extractor.input(self.input_name, mat)
-        except Exception:
-            # Some NCNN exports use a different input name; try the common
-            # fallback names when needed.
-            for name in ("data", "input", "images"):
-                try:
-                    self.extractor.input(name, mat)
-                    self.input_name = name
-                    break
-                except Exception:
+            used_rows, used_cols = set(), set()
+            for flat in np.argsort(dist, axis=None):
+                r, c = divmod(int(flat), dist.shape[1])
+                if r in used_rows or c in used_cols:
                     continue
-            else:
-                raise RuntimeError("Could not bind the NCNN input tensor.")
+                if dist[r, c] > self.max_distance:
+                    break  # sorted ascending: everything after is farther
+                oid = ids[r]
+                self.prev_y[oid] = self.objects[oid][1]
+                self.objects[oid] = tuple(centroids[c])
+                self.disappeared[oid] = 0
+                used_rows.add(r)
+                used_cols.add(c)
 
-        outputs = self._extract_output_tensors()
-        if not outputs:
-            return []
+            for r, oid in enumerate(ids):
+                if r not in used_rows:
+                    self._mark_missing(oid)
+            for c, pt in enumerate(centroids):
+                if c not in used_cols:
+                    self._register(pt)
 
-        candidates = []
-        for out in outputs:
-            arr = np.asarray(self._mat_to_numpy(out), dtype=np.float32)
-            if arr.size == 0:
+        return {
+            oid: (pt[0], pt[1], self.prev_y.get(oid, pt[1]))
+            for oid, pt in self.objects.items()
+            if self.disappeared.get(oid, 0) == 0
+        }
+
+    def _register(self, pt):
+        self.objects[self.next_id] = tuple(pt)
+        self.prev_y[self.next_id] = pt[1]
+        self.disappeared[self.next_id] = 0
+        self.next_id += 1
+
+    def _mark_missing(self, oid):
+        self.disappeared[oid] = self.disappeared.get(oid, 0) + 1
+        if self.disappeared[oid] > self.max_disappeared:
+            for d in (self.objects, self.prev_y, self.disappeared):
+                d.pop(oid, None)
+
+    def reset(self):
+        self.__init__(self.max_distance, self.max_disappeared)
+
+
+class ShrimpCounter:
+    """Detector + tracker + line-crossing count. Thread-safe getters.
+
+    direction: "down" counts crossings of the line top->bottom (y increasing),
+               "up" counts bottom->top, "both" counts either.
+    """
+
+    def __init__(self, detector=None, line_y_fraction=0.80, direction="down"):
+        self.detector = detector or NcnnDetector()
+        self.tracker = CentroidTracker()
+        self.line_y_fraction = line_y_fraction
+        self.direction = direction
+        self._counted = set()
+        self._count = 0
+        self._detections = []
+        self._lock = threading.Lock()
+
+    # same role as /api/count_line POST in main.py
+    def set_line_fraction(self, fraction):
+        with self._lock:
+            self.line_y_fraction = float(fraction)
+
+    @property
+    def count(self):
+        with self._lock:
+            return self._count
+
+    @property
+    def detections(self):
+        with self._lock:
+            return list(self._detections)
+
+    def reset_count(self):
+        with self._lock:
+            self._count = 0
+            self._counted.clear()
+            self.tracker.reset()
+
+    def process(self, frame):
+        """Run detection + tracking on one frame. Returns detections list."""
+        dets = self.detector.detect(frame)
+        centroids = [((d[0] + d[2]) / 2, (d[1] + d[3]) / 2) for d in dets]
+        tracked = self.tracker.update(centroids)
+
+        line_y = self.line_y_fraction * frame.shape[0]
+        with self._lock:
+            for oid, (_, cy, prev_cy) in tracked.items():
+                if oid in self._counted:
+                    continue
+                crossed_down = prev_cy < line_y <= cy
+                crossed_up = prev_cy > line_y >= cy
+                if (
+                    (self.direction == "down" and crossed_down)
+                    or (self.direction == "up" and crossed_up)
+                    or (self.direction == "both" and (crossed_down or crossed_up))
+                ):
+                    self._counted.add(oid)
+                    self._count += 1
+            self._detections = dets
+        return dets
+
+
+# ---------------------------------------------------------------------------
+# Background inference worker (keeps Flask / the MJPEG stream responsive)
+# ---------------------------------------------------------------------------
+class InferenceWorker(threading.Thread):
+    """Pulls the newest frame from `get_frame()` and runs counter.process().
+
+    get_frame: callable returning an HxWx3 uint8 numpy array (or None).
+    CPU inference is slower than the old on-sensor path, so this always works
+    on the LATEST frame and drops older ones instead of queueing them.
+    """
+
+    def __init__(self, counter, get_frame, min_interval=0.0):
+        super().__init__(daemon=True)
+        self.counter = counter
+        self.get_frame = get_frame
+        self.min_interval = min_interval
+        self._stop_evt = threading.Event()
+        self.last_ms = 0.0
+
+    def run(self):
+        while not self._stop_evt.is_set():
+            t0 = time.time()
+            frame = self.get_frame()
+            if frame is None:
+                time.sleep(0.01)
                 continue
+            try:
+                self.counter.process(frame)
+            except Exception as exc:  # keep the worker alive
+                print(f"[ncnn] inference error: {exc}")
+                time.sleep(0.1)
+            self.last_ms = (time.time() - t0) * 1000.0
+            sleep_for = self.min_interval - (time.time() - t0)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
-            if arr.ndim == 1:
-                arr = arr.reshape(1, -1)
-            elif arr.ndim == 3:
-                # Common NCNN YOLO output layout: [1, N, C] -> flatten to [N, C]
-                arr = arr.reshape(-1, arr.shape[-1])
-            elif arr.ndim > 2:
-                arr = arr.reshape(-1, arr.shape[-1])
-
-            if arr.shape[-1] < 4:
-                continue
-            candidates.append(arr)
-
-        if not candidates:
-            return []
-
-        pred = np.concatenate(candidates, axis=0)
-        if pred.shape[0] == 0:
-            return []
-
-        return self._decode_yolov8(pred, meta)
-
-    def _count_crossing_objects(self, detections: List[dict], count_line_y_fraction: float = 0.62):
-        """Track centroid movement and increment the count when an object crosses the line."""
-        height = int(self.input_size[1] * count_line_y_fraction)
-        split_y = height
-
-        current_centroids = []
-        for det in detections:
-            x, y, w, h = det["box"]
-            cx = int(x + w / 2)
-            cy = int(y + h / 2)
-            current_centroids.append((cx, cy, x, y, w, h))
-
-        if not current_centroids:
-            for obj_id in list(self.tracked_objects.keys()):
-                self.tracked_objects[obj_id]["disappeared"] += 1
-                if self.tracked_objects[obj_id]["disappeared"] > 8:
-                    del self.tracked_objects[obj_id]
-            return 0
-
-        if not self.tracked_objects:
-            for cx, cy, x, y, w, h in current_centroids:
-                self.tracked_objects[self.next_object_id] = {
-                    "centroid": (cx, cy),
-                    "counted": cy > split_y,
-                    "disappeared": 0,
-                }
-                self.next_object_id += 1
-            return sum(1 for obj in self.tracked_objects.values() if obj["counted"])
-
-        used_centroids = set()
-        used_ids = set()
-        distances = []
-        for i, (cx, cy, x, y, w, h) in enumerate(current_centroids):
-            for obj_id, data in self.tracked_objects.items():
-                prev_cx, prev_cy = data["centroid"]
-                distance = math.hypot(cx - prev_cx, cy - prev_cy)
-                if distance <= 40:
-                    distances.append((distance, obj_id, i))
-
-        distances.sort(key=lambda item: item[0])
-
-        for distance, obj_id, i in distances:
-            if obj_id in used_ids or i in used_centroids:
-                continue
-            used_ids.add(obj_id)
-            used_centroids.add(i)
-
-            cx, cy = current_centroids[i][0], current_centroids[i][1]
-            prev_cy = self.tracked_objects[obj_id]["centroid"][1]
-            self.tracked_objects[obj_id]["centroid"] = (cx, cy)
-            self.tracked_objects[obj_id]["disappeared"] = 0
-
-            if prev_cy <= split_y and cy > split_y and not self.tracked_objects[obj_id]["counted"]:
-                self.tracked_objects[obj_id]["counted"] = True
-                self.total_count += 1
-
-        for obj_id in list(self.tracked_objects.keys()):
-            if obj_id not in used_ids:
-                self.tracked_objects[obj_id]["disappeared"] += 1
-                if self.tracked_objects[obj_id]["disappeared"] > 8:
-                    del self.tracked_objects[obj_id]
-
-        for i, (cx, cy, x, y, w, h) in enumerate(current_centroids):
-            if i not in used_centroids:
-                self.tracked_objects[self.next_object_id] = {
-                    "centroid": (cx, cy),
-                    "counted": cy > split_y,
-                    "disappeared": 0,
-                }
-                self.next_object_id += 1
-
-        return self.total_count
-
-    def count_frame(self, frame_bgr: np.ndarray, count_line_y_fraction: float = 0.62) -> Tuple[int, List[dict]]:
-        """Convenience method that returns (counted_total, detections)."""
-        detections = self.detect(frame_bgr)
-        counted = self._count_crossing_objects(detections, count_line_y_fraction)
-        return counted, detections
+    def stop(self):
+        self._stop_evt.set()
 
 
 if __name__ == "__main__":
-    detector = NcnnShrimpCounter(
-        model_param="models/shrimp_yolov8.param",
-        model_bin="models/shrimp_yolov8.bin",
-        labels_path="models/labels.txt",
-        conf_threshold=0.25,
-        input_name="images",
-        output_names=("output",),
-    )
+    # Quick standalone check: python3 ncnn_detector.py some_image.jpg
+    import sys
 
-    frame = cv2.imread("test.jpg")
-    if frame is None:
-        raise FileNotFoundError("Place a sample image at test.jpg to test the NCNN detector.")
-
-    count, detections = detector.count_frame(frame)
-    print(f"Detected shrimp count: {count}")
-    print(f"Detections: {len(detections)}")
+    img = cv2.imread(sys.argv[1]) if len(sys.argv) > 1 else None
+    if img is None:
+        sys.exit("usage: python3 ncnn_detector.py <image>")
+    det = NcnnDetector(frame_is_bgr=True)  # cv2.imread is BGR
+    t0 = time.time()
+    results = det.detect(img)
+    print(f"{len(results)} detections in {(time.time() - t0) * 1000:.0f} ms")
+    for r in results:
+        print(f"  box=({r[0]:.0f},{r[1]:.0f},{r[2]:.0f},{r[3]:.0f}) conf={r[4]:.2f} cls={r[5]}")

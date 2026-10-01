@@ -67,23 +67,28 @@ If `pip install ncnn` fails on your Pi, try the distro package if available or b
 
 ## Prepare the NCNN model files
 
-This app expects the NCNN model export in the `models/` folder.
+This app expects the NCNN model export in the `models/` folder, matching the exact Ultralytics export structure from:
 
-Your files should look like this:
+```bash
+yolo export model=best.pt format=ncnn imgsz=640
+```
+
+The expected layout is:
 
 ```bash
 models/
-  labels.txt
-  shrimp_ncnn.param
-  shrimp_ncnn.bin
+  best_ncnn_model/
+    model.ncnn.param
+    model.ncnn.bin
+    labels.txt   # if exported with labels
 ```
 
-If your files have different names, update these constants in `main.py`:
+Legacy names like `shrimp_ncnn.param` / `shrimp_ncnn.bin` are still accepted for compatibility, but the default export path matches the Ultralytics output exactly. If your files have different names, update these constants in `main.py`:
 
 ```python
-NCNN_MODEL_PARAM = os.path.join(..., "models", "shrimp_ncnn.param")
-NCNN_MODEL_BIN = os.path.join(..., "models", "shrimp_ncnn.bin")
-NCNN_LABELS_PATH = os.path.join(..., "models", "labels.txt")
+NCNN_MODEL_PARAM = os.path.join(..., "models", "best_ncnn_model", "model.ncnn.param")
+NCNN_MODEL_BIN = os.path.join(..., "models", "best_ncnn_model", "model.ncnn.bin")
+NCNN_LABELS_PATH = os.path.join(..., "models", "best_ncnn_model", "labels.txt")
 ```
 
 For the IMX500 fallback, the old files are also referenced in `main.py`:
